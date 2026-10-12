@@ -1,0 +1,56 @@
+name: App Analyzer Bot
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'   # ၅ နာရီတစ်ခါ auto-restart (GitHub limit 6h)
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'app_analyzer_bot.py'
+      - 'requirements.txt'
+      - '.github/workflows/analyzer.yml'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350    # 5h 50min
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Cache pip
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Create work dir
+      run: mkdir -p app_analysis
+
+    - name: Run Analyzer Bot
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      run: |
+        python app_analyzer_bot.py
+
+    - name: Upload analysis artifacts (on failure)
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: analysis-logs
+        path: app_analysis/
+        retention-days: 7
