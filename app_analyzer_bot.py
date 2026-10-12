@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-App Static Analyzer Bot — GitHub Actions Edition
-Analyzes APK/ZIP for secrets, API endpoints, security issues
+App Static Analyzer Bot — MTProto Edition (Telethon)
+Uses Telegram MTProto API for up to 2GB file support
 """
 
 import os
@@ -12,20 +12,33 @@ import zipfile
 import shutil
 import signal
 import sys
+import logging
 from datetime import datetime
 from urllib.parse import urlparse
 from collections import defaultdict
 
-import aiohttp
+from telethon import TelegramClient, events, functions, types
+from telethon.sessions import MemorySession
+from telethon.tl.types import DocumentAttributeFilename
 
 # ==================== CONFIG ====================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8636614665:AAEiOHIh-4cYkpq1uIl3DczFx6XQqWC9Q58")
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+API_ID = 37289442
+API_HASH = "66ce67a84ce9e8b9d49ef3d66acdaf1c"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8636614665:AAEiOHIh-4cYkpq1uIl3DczFx6XQqWC9Q58")
+
 WORK_DIR = "app_analysis"
 os.makedirs(WORK_DIR, exist_ok=True)
 
-last_update_id = 0
-running = True
+MAX_FILE_MB = 2000   # MTProto limit ~2GB
+WARN_FILE_MB = 500   # Warn above this
+
+# ==================== LOGGING ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+log = logging.getLogger("analyzer")
 
 # ==================== PATTERNS ====================
 PATTERNS = {
@@ -44,7 +57,6 @@ PATTERNS = {
     "private_key": re.compile(r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----'),
     "bearer": re.compile(r'["\']Bearer\s+[a-zA-Z0-9_\-.]+["\']'),
     "basic_auth": re.compile(r'["\']Basic\s+[A-Za-z0-9+/=]{20,}["\']'),
-
     "api_key_assign": re.compile(
         r'(api[_-]?key|apikey|secret|token|password|passwd|pwd)\s*[:=]\s*["\']([^"\']{6,100})["\']',
         re.IGNORECASE
@@ -80,79 +92,6 @@ TEXT_EXTS = {
 }
 
 
-# ==================== TELEGRAM ====================
-async def tg_send(chat_id, text):
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{TELEGRAM_API}/sendMessage",
-                json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "Markdown"},
-                timeout=15
-            ) as r:
-                return r.status == 200
-    except Exception as e:
-        print(f"tg_send err: {e}")
-        return False
-
-
-async def tg_send_doc(chat_id, path, caption=""):
-    try:
-        async with aiohttp.ClientSession() as s:
-            with open(path, "rb") as f:
-                form = aiohttp.FormData()
-                form.add_field("chat_id", str(chat_id))
-                form.add_field("document", f, filename=os.path.basename(path))
-                if caption:
-                    form.add_field("caption", caption)
-                async with s.post(f"{TELEGRAM_API}/sendDocument", data=form, timeout=300) as r:
-                    return r.status == 200
-    except Exception as e:
-        print(f"tg_send_doc err: {e}")
-        return False
-
-
-async def tg_get_updates(offset=0):
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"{TELEGRAM_API}/getUpdates",
-                params={"timeout": 30, "offset": offset},
-                timeout=35
-            ) as r:
-                data = await r.json()
-                if data.get("ok"):
-                    return data.get("result", [])
-    except:
-        pass
-    return []
-
-
-async def tg_download(file_id, dest):
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{TELEGRAM_API}/getFile",
-                json={"file_id": file_id},
-                timeout=15
-            ) as r:
-                data = await r.json()
-                if not data.get("ok"):
-                    return False
-                fp = data["result"]["file_path"]
-
-            dl = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{fp}"
-            async with s.get(dl, timeout=600) as r:
-                if r.status != 200:
-                    return False
-                with open(dest, "wb") as f:
-                    async for chunk in r.content.iter_chunked(1024 * 1024):
-                        f.write(chunk)
-            return True
-    except Exception as e:
-        print(f"tg_download err: {e}")
-        return False
-
-
 # ==================== ANALYSIS ====================
 def is_whitelisted(url):
     try:
@@ -171,59 +110,44 @@ def analyze_text(content, result):
 
         if name == "http_url":
             for m in matches[:100]:
-                if is_whitelisted(m):
-                    continue
+                if is_whitelisted(m): continue
                 result["urls"].add(m[:300])
-
         elif name == "http_insecure":
             for m in matches[:50]:
-                if is_whitelisted(m):
-                    continue
+                if is_whitelisted(m): continue
                 result["insecure_urls"].add(m[:200])
-
         elif name == "api_path":
             for m in matches[:100]:
                 result["api_paths"].add(m)
-
         elif name == "ws_url":
             for m in matches[:50]:
-                if is_whitelisted(m):
-                    continue
+                if is_whitelisted(m): continue
                 result["ws_urls"].add(m[:200])
-
         elif name in ["jwt", "aws_access", "google_api", "firebase_key",
                       "stripe", "bearer", "basic_auth", "private_key"]:
             for m in matches[:20]:
-                if isinstance(m, tuple):
-                    m = m[0]
+                if isinstance(m, tuple): m = m[0]
                 result["secrets"].add(f"{name}: {m[:120]}")
-
         elif name == "firebase_url":
             for m in matches[:20]:
                 result["firebase"].add(m)
-
         elif name == "api_key_assign":
             for k, v in matches[:30]:
                 if v.lower() in ["null", "none", "true", "false", "your_key",
                                  "change_me", "xxx", "test"]:
                     continue
-                if len(v) < 8:
-                    continue
+                if len(v) < 8: continue
                 result["config_secrets"].add(f"{k} = {v[:60]}")
-
         elif name == "android_permission":
             for m in matches[:50]:
                 result["permissions"].add(m)
-
         elif name == "android_package":
             for m in matches[:30]:
                 if m.count(".") >= 2 and len(m) < 80:
                     result["packages"].add(m)
-
         elif name == "localhost":
             for m in matches[:20]:
                 result["localhost_refs"].add(str(m))
-
         elif name == "debug_flag":
             for m in matches[:10]:
                 result["debug_flags"].add(str(m))
@@ -325,28 +249,28 @@ def find_issues(r):
     critical, warning, info = [], [], []
 
     if r["secrets"]:
-        critical.append(f"🔴 *{len(r['secrets'])} hardcoded secrets* — JWT/API keys in source")
+        critical.append(f"🔴 {len(r['secrets'])} hardcoded secrets — JWT/API keys in source")
     if r["config_secrets"]:
-        critical.append(f"🔴 *{len(r['config_secrets'])} config secrets* — plain text keys")
+        critical.append(f"🔴 {len(r['config_secrets'])} config secrets — plain text keys")
     pk = [s for s in r["secrets"] if "private_key" in s]
     if pk:
-        critical.append(f"🔴 *{len(pk)} private key(s)* leaked")
+        critical.append(f"🔴 {len(pk)} private key(s) leaked")
     if r["insecure_urls"]:
-        critical.append(f"🔴 *{len(r['insecure_urls'])} HTTP (not HTTPS)* URLs")
+        critical.append(f"🔴 {len(r['insecure_urls'])} HTTP (not HTTPS) URLs")
 
     if r["localhost_refs"]:
-        warning.append(f"🟡 *{len(r['localhost_refs'])} localhost refs* — dev URLs")
+        warning.append(f"🟡 {len(r['localhost_refs'])} localhost refs")
     if r["debug_flags"]:
-        warning.append(f"🟡 *{len(r['debug_flags'])} debug flags* enabled")
+        warning.append(f"🟡 {len(r['debug_flags'])} debug flags enabled")
     for df in r["dangerous_files"]:
-        warning.append(f"🟡 *Dangerous file:* `{df}`")
+        warning.append(f"🟡 Dangerous file: {df}")
     if r["firebase"]:
-        warning.append(f"🟡 *Firebase URL exposed*")
+        warning.append("🟡 Firebase URL exposed")
 
     big = sorted(r.get("big_files", []), key=lambda x: -x[1])[:5]
     for name, size in big:
         if size > 20 * 1024 * 1024:
-            warning.append(f"🟡 *Large file:* `{name}` ({size/1024/1024:.1f} MB)")
+            warning.append(f"🟡 Large file: {name} ({size/1024/1024:.1f} MB)")
 
     if not r["api_paths"] and not r["urls"]:
         info.append("ℹ️ No API endpoints found")
@@ -358,12 +282,12 @@ def find_issues(r):
 
 def format_report(r, filename):
     if "error" in r:
-        return f"❌ *Analysis Failed*\n\n`{r['error']}`"
+        return f"❌ Analysis Failed\n\n{r['error']}"
 
     critical, warning, info = find_issues(r)
-    lines = [f"📦 *App Analysis: `{filename}`*", ""]
+    lines = [f"📦 App Analysis: {filename}", ""]
 
-    lines.append("📊 *Overview*")
+    lines.append("📊 Overview")
     lines.append(f"• Files: {r['file_count']:,}")
     lines.append(f"• Size: {r['total_size']/1024/1024:.2f} MB")
     lines.append(f"• Uncompressed: {r['uncompressed_size']/1024/1024:.2f} MB")
@@ -371,126 +295,127 @@ def format_report(r, filename):
     lines.append("")
 
     if critical:
-        lines.append("🚨 *CRITICAL ISSUES*")
+        lines.append("🚨 CRITICAL ISSUES")
         lines.extend(critical[:10])
         lines.append("")
     if warning:
-        lines.append("⚠️ *WARNINGS*")
+        lines.append("⚠️ WARNINGS")
         lines.extend(warning[:15])
         lines.append("")
     if info:
-        lines.append("ℹ️ *INFO*")
+        lines.append("ℹ️ INFO")
         lines.extend(info[:10])
         lines.append("")
 
     if r["api_paths"]:
-        lines.append(f"🔌 *API Endpoints ({len(r['api_paths'])})*")
+        lines.append(f"🔌 API Endpoints ({len(r['api_paths'])})")
         for p in r["api_paths"][:25]:
-            lines.append(f"• `{p}`")
+            lines.append(f"• {p}")
         if len(r["api_paths"]) > 25:
             lines.append(f"  ... +{len(r['api_paths'])-25} more")
         lines.append("")
 
     if r["urls"]:
-        lines.append(f"🌐 *URLs ({len(r['urls'])})*")
+        lines.append(f"🌐 URLs ({len(r['urls'])})")
         for u in r["urls"][:15]:
-            lines.append(f"• `{u[:100]}`")
+            lines.append(f"• {u[:100]}")
         if len(r["urls"]) > 15:
             lines.append(f"  ... +{len(r['urls'])-15} more")
         lines.append("")
 
     if r["ws_urls"]:
-        lines.append("🔌 *WebSocket URLs*")
+        lines.append("🔌 WebSocket URLs")
         for u in r["ws_urls"][:10]:
-            lines.append(f"• `{u[:100]}`")
+            lines.append(f"• {u[:100]}")
         lines.append("")
 
     if r["secrets"] or r["config_secrets"]:
-        lines.append("🔑 *Secrets Found (CRITICAL!)*")
+        lines.append("🔑 Secrets Found (CRITICAL!)")
         for s in r["secrets"][:5]:
-            lines.append(f"• `{s[:100]}`")
+            lines.append(f"• {s[:100]}")
         for s in r["config_secrets"][:5]:
-            lines.append(f"• `{s[:100]}`")
+            lines.append(f"• {s[:100]}")
         lines.append("")
 
-    lines.append("📁 *File Types*")
+    lines.append("📁 File Types")
     for ext, cnt in list(r["file_types"].items())[:12]:
-        lines.append(f"• `{ext or 'no ext'}`: {cnt}")
+        lines.append(f"• {ext or 'no ext'}: {cnt}")
     lines.append("")
 
     if r["permissions"]:
-        lines.append(f"🔐 *Permissions ({len(r['permissions'])})*")
+        lines.append(f"🔐 Permissions ({len(r['permissions'])})")
         for p in r["permissions"][:15]:
-            lines.append(f"• `{p}`")
+            lines.append(f"• {p}")
         if len(r["permissions"]) > 15:
             lines.append(f"  ... +{len(r['permissions'])-15} more")
         lines.append("")
 
-    return "\n".join(lines)[:4000]
+    return "\n".join(lines)
+
+
+# ==================== TELETHON CLIENT ====================
+def create_client():
+    """Create Telethon client using MemorySession (no file persistence)."""
+    session = MemorySession()
+    client = TelegramClient(session, API_ID, API_HASH)
+    return client
 
 
 # ==================== HANDLER ====================
-async def handle_message(update):
-    msg = update.get("message")
-    if not msg:
-        return
-    chat_id = msg["chat"]["id"]
-    text = (msg.get("text") or "").strip()
+async def handle_document(event):
+    """Handle ZIP document uploads."""
+    msg = event.message
+    chat_id = event.chat_id
 
-    if text.startswith("/start"):
-        await tg_send(chat_id,
-            "🔍 *App Analyzer Bot*\n\n"
-            "📤 ZIP file ပို့ပါ (APK, JAR, Electron, etc.)\n\n"
-            "📋 *ရရှိမည့်အချက်:*\n"
-            "• ✅ API endpoints\n"
-            "• 🔴 Secrets/Keys leak\n"
-            "• ⚠️ HTTP URLs\n"
-            "• 🐞 Debug flags\n"
-            "• 📁 Tech stack\n"
-            "• 🔐 Permissions\n\n"
-            "⚠️ Max 100 MB. မင်းပိုင် app ပဲ ပို့ပါ။"
-        )
+    if not msg.document:
         return
 
-    if text == "/help":
-        await tg_send(chat_id,
-            "📚 *Help*\n\n"
-            "1. `.zip` file ပို့\n"
-            "2. Analysis စောင့်\n"
-            "3. Report ရ\n\n"
-            "⚠️ Static analysis ပဲ"
-        )
-        return
+    # Get filename
+    fname = "app.zip"
+    for attr in msg.document.attributes:
+        if isinstance(attr, DocumentAttributeFilename):
+            fname = attr.file_name
+            break
 
-    doc = msg.get("document")
-    if not doc:
-        if text:
-            await tg_send(chat_id, "📤 ZIP file ပို့ပါ။ /help")
-        return
-
-    fname = doc.get("file_name", "app.zip")
     if not fname.lower().endswith(".zip"):
-        await tg_send(chat_id, "❌ `.zip` file ပဲ လက်ခံတယ်။")
+        await event.reply("❌ .zip file ပဲ လက်ခံတယ်။")
         return
 
-    fsize = doc.get("file_size", 0)
-    if fsize > 100 * 1024 * 1024:
-        await tg_send(chat_id, f"❌ File ကြီးလွန်း ({fsize/1024/1024:.1f} MB). Max 100 MB.")
+    fsize = msg.document.size
+    fsize_mb = fsize / 1024 / 1024
+
+    log.info(f"Received: {fname} ({fsize_mb:.1f} MB) from {chat_id}")
+
+    if fsize_mb > MAX_FILE_MB:
+        await event.reply(
+            f"❌ File ကြီးလွန်း ({fsize_mb:.1f} MB). Max {MAX_FILE_MB} MB."
+        )
         return
 
-    await tg_send(chat_id, f"📥 Downloading `{fname}` ({fsize/1024/1024:.1f} MB)...")
+    await event.reply(f"📥 Downloading {fname} ({fsize_mb:.1f} MB)...")
 
     ts = int(datetime.now().timestamp())
     zip_path = os.path.join(WORK_DIR, f"{chat_id}_{ts}.zip")
     extract_dir = os.path.join(WORK_DIR, f"{chat_id}_{ts}_extracted")
 
-    ok = await tg_download(doc["file_id"], zip_path)
-    if not ok:
-        await tg_send(chat_id, "❌ Download failed.")
+    # Download via MTProto (up to 2GB)
+    try:
+        log.info(f"Downloading to {zip_path}...")
+        await event.client.download_media(msg, file=zip_path)
+        actual_size = os.path.getsize(zip_path) if os.path.exists(zip_path) else 0
+        log.info(f"Downloaded: {actual_size/1024/1024:.1f} MB")
+    except Exception as e:
+        log.error(f"Download failed: {e}")
+        await event.reply(f"❌ Download failed: {str(e)[:200]}")
         return
 
-    await tg_send(chat_id, "🔍 Analyzing...")
+    if not os.path.exists(zip_path) or os.path.getsize(zip_path) == 0:
+        await event.reply("❌ Downloaded file empty.")
+        return
 
+    await event.reply(f"✅ Downloaded ({actual_size/1024/1024:.1f} MB)\n🔍 Analyzing...")
+
+    # Analyze in executor
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, analyze_zip, zip_path, extract_dir)
 
@@ -499,20 +424,31 @@ async def handle_message(update):
         json.dump(result, f, indent=2, default=str, ensure_ascii=False)
 
     if "error" in result:
-        await tg_send(chat_id, format_report(result, fname))
+        await event.reply(format_report(result, fname)[:4000])
     else:
         formatted = format_report(result, fname)
-        await tg_send(chat_id, formatted)
-        await tg_send_doc(chat_id, json_path, caption="📄 Full JSON report")
+        # Send in chunks if too long
+        if len(formatted) > 4000:
+            for i in range(0, len(formatted), 4000):
+                await event.reply(formatted[i:i+4000])
+        else:
+            await event.reply(formatted)
+
+        # Send JSON
+        try:
+            await event.reply(file=json_path, message="📄 Full JSON report")
+        except Exception as e:
+            log.error(f"Send JSON error: {e}")
 
         critical, warning, info = find_issues(result)
-        await tg_send(chat_id,
-            f"✅ *Analysis Complete*\n\n"
+        await event.reply(
+            f"✅ Analysis Complete\n\n"
             f"🚨 Critical: {len(critical)}\n"
             f"⚠️ Warnings: {len(warning)}\n"
             f"ℹ️ Info: {len(info)}"
         )
 
+    # Cleanup
     try:
         shutil.rmtree(extract_dir, ignore_errors=True)
         os.remove(zip_path)
@@ -521,38 +457,86 @@ async def handle_message(update):
         pass
 
 
+async def handle_start(event):
+    await event.reply(
+        "🔍 App Analyzer Bot (MTProto)\n\n"
+        "📤 ZIP file ပို့ပါ\n\n"
+        "📋 ရရှိမည့်အချက်:\n"
+        "• API endpoints\n"
+        "• Secrets/Keys\n"
+        "• HTTP URLs\n"
+        "• Debug flags\n"
+        "• Tech stack\n"
+        "• Permissions\n\n"
+        f"⚠️ Max {MAX_FILE_MB} MB (MTProto)\n"
+        "💡 မင်းပိုင် app ပဲ ပို့ပါ။"
+    )
+
+
+async def handle_help(event):
+    await event.reply(
+        "📚 Help\n\n"
+        "1. .zip file ပို့\n"
+        "2. Analysis စောင့် (30s-2min)\n"
+        "3. Report ရ\n\n"
+        f"📦 Max size: {MAX_FILE_MB} MB\n"
+        "⚠️ Static analysis ပဲ"
+    )
+
+
 # ==================== MAIN ====================
 async def main():
-    global last_update_id, running
     print("=" * 50)
-    print(f"🔍 App Analyzer Bot started at {datetime.now()}")
-    print(f"Token: {TELEGRAM_BOT_TOKEN[:15]}...")
+    print("🔍 App Analyzer Bot (MTProto/Telethon)")
+    print(f"API ID: {API_ID}")
+    print(f"Started: {datetime.now()}")
     print("=" * 50)
 
-    # Graceful shutdown for GitHub Actions
-    def shutdown(sig, frame):
-        global running
-        print("Shutdown signal received")
-        running = False
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+    client = create_client()
 
-    while running:
+    # Register handlers
+    @client.on(events.NewMessage(pattern=r'^/start'))
+    async def on_start(event):
+        await handle_start(event)
+
+    @client.on(events.NewMessage(pattern=r'^/help'))
+    async def on_help(event):
+        await handle_help(event)
+
+    @client.on(events.NewMessage(func=lambda e: e.document is not None))
+    async def on_doc(event):
         try:
-            updates = await tg_get_updates(last_update_id + 1)
-            for u in updates:
-                if u.get("update_id", 0) > last_update_id:
-                    last_update_id = u["update_id"]
-                try:
-                    await handle_message(u)
-                except Exception as e:
-                    print(f"Handler error: {e}")
-            await asyncio.sleep(1)
+            await handle_document(event)
         except Exception as e:
-            print(f"Main error: {e}")
-            await asyncio.sleep(5)
+            log.error(f"Handler error: {e}")
+            try:
+                await event.reply(f"❌ Error: {str(e)[:200]}")
+            except:
+                pass
 
-    print("Bot stopped")
+    # Start bot
+    await client.start(bot_token=BOT_TOKEN)
+    me = await client.get_me()
+    log.info(f"✅ Bot started as @{me.username}")
+
+    # Graceful shutdown
+    stop_event = asyncio.Event()
+
+    def signal_handler():
+        log.info("Shutdown signal received")
+        stop_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            pass
+
+    # Run until stopped
+    await stop_event.wait()
+    await client.disconnect()
+    log.info("Bot stopped")
 
 
 if __name__ == "__main__":
